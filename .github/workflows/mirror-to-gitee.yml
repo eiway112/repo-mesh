@@ -1,0 +1,163 @@
+# 本仓三处镜像点（2026-10-08 实测）
+#
+# 方向唯一：开发源 -> GitHub 公开仓 -> Gitee 公开仓。
+# 双向同步必然产生冲突与漂移，故镜像侧一律不得反向写入。
+#
+# 凭据：仓库 Settings -> Secrets -> New repository secret
+#   GITEE_SSH_KEY：与 Gitee **个人 SSH 公钥**配对的私钥（单行 PEM，含 BEGIN/END 行）
+#
+# 为什么用个人 SSH 公钥而非部署公钥（2026-10-08 实测决定）：
+#   部署公钥（DeployKey）在 Gitee 上**实测为只读**，报
+#   `DeployKey does not support push code`，且仓库设置页只有「删除/停用」，
+#   **没有「允许写入」勾选项**（网上教程与真实界面矛盾，以实测为准）。
+#   故改用个人 SSH 公钥：读写权限确定可用，代价是作用范围为该 Gitee 账号下全部仓库。
+#   缓解：用**专用密钥**（非本机开发密钥），泄露面不牵涉本机开发身份，
+#   且可在 Gitee「个人设置 → SSH 公钥」中单独停用。
+#
+# 判据来源：总则.md T5 第2 条（2026-10-08 修订）——
+# 本工作流属"已审定内容的单向机械镜像"，零内容决策，故允许自动化。
+
+name: Mirror to Gitee
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Gitee 仓为只读镜像：任何自动任务不得向 GitHub 反向写入。
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-to-gitee
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Gitee credentials
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          # 私钥由 GitHub Secret 注入；权限必须 600，否则 ssh 拒绝使用
+          printf '%s\n' "${{ secrets.GITEE_SSH_KEY }}" > ~/.ssh/id_ci
+          chmod 600 ~/.ssh/id_ci
+
+          # 严格主机校验：Gitee 的 ED25519 主机公钥。
+          # 取值来自本机 `ssh-keyscan -t ed25519 gitee.com` 实测（2026-10-08）。
+          # 写死而非自动收集 known_hosts —— 本仓远端固定，不为"换主机"留口子；
+          # 自动收集反而会在被劫持时静默接受。
+          cat > ~/.ssh/known_hosts <<'EOF'
+          gitee.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEKxHSJ7084RmkJ4YdEi5tngynE8aZe2uEoVVsB/OvYN
+          EOF
+          chmod 644 ~/.ssh/known_hosts
+
+          # IdentitiesOnly=yes：只用这把钥匙，不回落到runner 上的其他私钥
+          cat > ~/.ssh/config <<'EOF'
+          Host gitee.com
+            IdentityFile ~/.ssh/id_ci
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+          # 提交身份一律走仓库变量，不在本文件硬编码任何真实邮箱。
+          # 攻穿记录（2026-10-08）：此处曾硬编码一个私人邮箱作为默认值，
+          # 而 .github/workflows/*.yml 当时不在 M11 扫描面内（后缀白名单漏），
+          # 于是该邮箱随公开仓分发出去、门禁长期全绿。两处都已修：
+          # ① 邮箱改为必填变量，无默认值——缺配置就失败，不静默用一个真值兜底；
+          # ② M11 扫描面改为按内容判定文本，与扩展名无关（见脚本 v0.8.0 注释）。
+          git config --global user.name  "${{ vars.GITEE_OWNER }}"
+          git config --global user.email "${{ vars.GITEE_USER_EMAIL }}"
+          if [ -z "${{ vars.GITEE_USER_EMAIL }}" ]; then
+            echo "ERROR: 未配置仓库变量 GITEE_USER_EMAIL，拒绝用占位地址提交"
+            exit 1
+          fi
+
+          OWNER="${{ vars.GITEE_OWNER }}"
+          git remote add gitee "git@gitee.com:${OWNER}/repo-mesh.git"
+
+          #这里刻意**不做**写权限自检。
+          #
+          # 攻穿自证（2026-10-08）：先后试过两种"看起来能验权限"的办法，**都是假判据**——
+          #   ① `git ls-remote`：本仓 Gitee 镜像是**公开仓**，用一把未登记的密钥
+          #      实测照样读出 refs（200）。读成功完全不能证明鉴权生效。
+          #   ② `git push --dry-run`：两端已同步时返回 "Everything up-to-date"
+          #      且退出码 0，用未登记密钥实测同样"通过"。
+          # 只有**真实 push** 才必然触发鉴权与写权限协商。
+          #
+          # 结论：预检在这里是自欺。改为只保证配置完整，真正的验证交给下面的 push，
+          # 失败时**完整回显 stderr**（不做关键词过滤——过滤即失明）。
+
+      - name: Mirror main and tags
+        run: |
+          # 实测（2026-10-08）：Gitee 拒绝更新隐藏 ref（refs/pull/* 等），
+          # `git push --mirror` 会连带推送这些 ref 而被 remote rejected，
+          # 且失败是"部分成功"——main 推了、tags 没推、退出码非0。
+          # 故显式列出要同步的 ref，不用 --mirror。
+          #
+          # 诊断纪律：失败时**完整回显 stderr，不做关键词过滤**。
+          # 第 4 次运行用 `grep -iE "auth|permission|..."` 过滤，
+          # 结果真实报错一个都不匹配、注解处只剩空的 "Error:"，
+          # 等于亲手丢弃诊断信息。教训：过滤即失明，宁可啰嗦。
+          #
+          # 注意：`if ! cmd | tee` 在 pipefail 下判断的是整个管道，
+          # git 失败会被 tee 稀释吗？不会——pipefail 已保证任一环失败即整体失败。
+          # 但为免歧义，改用「先跑并存退出码」再判断，不依赖管道语义。
+          set +e
+          git push --force gitee "refs/heads/main:refs/heads/main" > /tmp/push.log 2>&1
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::main 推送失败，git 退出码 $RC。完整输出（未经过滤）："
+            tr '\n' ';' < /tmp/push.log | sed 's/;/; /g'
+            echo "  常见成因：① GITEE_SSH_KEY 未加到 Gitee 个人 SSH 公钥；② 私钥内容不完整；③ Gitee 侧限流"
+            exit 1
+          fi
+          echo "main 推送完成"
+
+          set +e
+          git push --force gitee --tags > /tmp/tags.log 2>&1
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::tag 推送失败，git 退出码 $RC（main 已同步，tag 未同步）。完整输出："
+            tr '\n' ';' < /tmp/tags.log | sed 's/;/; /g'
+            exit 1
+          fi
+          echo "tag 推送完成"
+
+      - name: Verify mirror by remote read-back
+        run: |
+          # T5 第 5 条：判断"推没推成功"用远端回读，不看点。
+          # 缺陷注入自证（2026-10-08）：曾出现 main 已同步但 tags 全丢的
+          # 部分成功，若只校验 main 会误判为通过 —— 故 tags 一并纳入校验。
+          LOCAL="$(git rev-parse main)"
+          REMOTE="$(git ls-remote gitee refs/heads/main | cut -f1)"
+          if [ -z "$REMOTE" ]; then
+            echo "::error::Gitee 端读不到 main，推送未生效"
+            exit 1
+          fi
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "::error::SHA 不一致 local=$LOCAL remote=$REMOTE"
+            exit 1
+          fi
+
+          # tags 全量比对：本地有而远端没有 =漏推
+          LOCAL_TAGS="$(git ls-remote --tags origin | awk '{print $2}' | sort)"
+          REMOTE_TAGS="$(git ls-remote --tags gitee | awk '{print $2}' | sort)"
+          if [ "$LOCAL_TAGS" != "$REMOTE_TAGS" ]; then
+            echo "::error::tag 集合不一致"
+            echo "--- 本地有远端无 ---"
+            comm -23 <(echo "$LOCAL_TAGS") <(echo "$REMOTE_TAGS")
+            echo "--- 远端有本地无 ---"
+            comm -13 <(echo "$LOCAL_TAGS") <(echo "$REMOTE_TAGS")
+            exit 1
+          fi
+
+          echo "镜像校验通过 main=$LOCAL，tag 集合一致"
